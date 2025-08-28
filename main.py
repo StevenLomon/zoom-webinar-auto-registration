@@ -4,6 +4,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, EmailStr
 from requests.auth import HTTPBasicAuth
+from typing import Optional
 
 # --- Basic Configuration ---
 
@@ -51,7 +52,7 @@ app = FastAPI(
 # Zoom API requires first_name and last_name separately
 class Registrant(BaseModel):
     first_name: str
-    last_name: str
+    last_name: Optional[str] = None # Now optional, defaults to None
     email: EmailStr
 
 # --- Zoom Authentication Helper ---
