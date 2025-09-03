@@ -1,4 +1,4 @@
 env/
 .env
 __pycache__/
-zoom_auto_register.log
+zoom_and_ghl_processor.log
