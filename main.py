@@ -84,38 +84,24 @@ def get_zoom_access_token():
     
 # --- NEW: Zoom Data Fetching Helpers with Pagination ---
 def _fetch_all_from_zoom(endpoint_url: str, headers: Dict[str, str], data_key: str) -> List[Dict[str, Any]]:
-    """A generic helper to fetch all paginated results from a Zoom endpoint."""
     all_results = []
-    params = {"page_size": 300} # Request max page size
-    
+    params = {"page_size": 300}
     while True:
         try:
             response = requests.get(endpoint_url, headers=headers, params=params)
             response.raise_for_status()
             data = response.json()
-            
             results_on_page = data.get(data_key, [])
             all_results.extend(results_on_page)
-            
             next_page_token = data.get("next_page_token")
             if next_page_token:
                 params["next_page_token"] = next_page_token
             else:
-                break # Exit loop if there's no next page
+                break
         except requests.exceptions.RequestException as e:
             logging.error(f"Error fetching data from {endpoint_url}: {e}")
             raise HTTPException(status_code=502, detail=f"Failed to fetch {data_key} from Zoom.")
-            
     return all_results
-
-def get_all_webinar_registrants(webinar_id: str, access_token: str) -> List[Dict[str, Any]]:
-    """Fetches all registrants for a given webinar, handling pagination."""
-    logging.info(f"Fetching all registrants for webinar {webinar_id}...")
-    url = f"https://api.zoom.us/v2/webinars/{webinar_id}/registrants"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    registrants = _fetch_all_from_zoom(url, headers, "registrants")
-    logging.info(f"Found {len(registrants)} total registrants.")
-    return registrants
 
 def get_all_webinar_participants(webinar_id: str, access_token: str) -> List[Dict[str, Any]]:
     """Fetches all participants from a past webinar, handling pagination."""
@@ -126,7 +112,18 @@ def get_all_webinar_participants(webinar_id: str, access_token: str) -> List[Dic
     logging.info(f"Found {len(participants)} total participants.")
     return participants
 
-# --- NEW: GHL Webhook Helper ---
+# --- NEW HELPER FUNCTION for Absentees ---
+def get_all_webinar_absentees(webinar_id: str, access_token: str) -> List[Dict[str, Any]]:
+    """Fetches all absentees from a past webinar, handling pagination."""
+    logging.info(f"Fetching all ABSENTEES for past webinar {webinar_id}...")
+    url = f"https://api.zoom.us/v2/past_webinars/{webinar_id}/absentees"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    # Note: The API confusingly returns absentees under the 'registrants' key
+    absentees = _fetch_all_from_zoom(url, headers, "registrants")
+    logging.info(f"Found {len(absentees)} total absentees.")
+    return absentees
+
+# --- GHL Webhook Helper ---
 
 def send_to_ghl_webhook(contact_data: Dict[str, Any]):
     """Sends a single contact's data to the GHL Webhook."""
@@ -198,55 +195,52 @@ async def register_for_webinar(registrant: Registrant):
 
     return {"message": "An unexpected error occurred."} # Fallback
 
-# --- NEW: Post-Webinar Processing Endpoint ---
+# --- UPDATED: Post-Webinar Processing Endpoint ---
 
 @app.post("/process-attendees")
 async def process_webinar_attendees():
     """
-    Fetches webinar registrants and participants, compares them,
-    and sends the status of each registrant to a GHL webhook.
+    Fetches webinar participants and absentees separately and sends the
+    status of each person to a GHL webhook.
     """
-    logging.info("--- Starting Post-Webinar Attendee Processing ---")
+    logging.info("--- Starting Post-Webinar Processing (New Method) ---")
 
     # 1. Get a fresh access token
     access_token = get_zoom_access_token()
     
-    # 2. Fetch both lists from Zoom
-    registrants = get_all_webinar_registrants(ZOOM_WEBINAR_ID, access_token)
+    # 2. Fetch the two distinct lists from Zoom
     participants = get_all_webinar_participants(ZOOM_WEBINAR_ID, access_token)
+    absentees = get_all_webinar_absentees(ZOOM_WEBINAR_ID, access_token)
 
-    if not registrants:
-        logging.warning("No registrants found for the webinar. Aborting process.")
-        return {"message": "No registrants found. Nothing to process."}
+    # 3. Process the ATTENDEES (Participants)
+    logging.info(f"--- Processing {len(participants)} Attendees ---")
+    for person in participants:
+        # The participant object has a 'name' field, let's safely split it
+        name_parts = person.get("name", "").split(" ", 1)
+        first_name = name_parts[0]
+        last_name = name_parts[1] if len(name_parts) > 1 else ""
 
-    # 3. Create a set of participant emails for fast lookups
-    # The 'user_email' key is used in the participant list
-    participant_emails = {p["user_email"].lower() for p in participants}
-    
-    processed_count = 0
-    attended_count = 0
-    
-    # 4. Iterate through every original registrant
-    for registrant in registrants:
-        registrant_email = registrant["email"].lower()
-        
-        attended_status = 1 if registrant_email in participant_emails else 0
-        
-        if attended_status == 1:
-            attended_count += 1
-            
-        # 5. Prepare and send data to GHL
         contact_payload = {
-            "first_name": registrant.get("first_name"),
-            "last_name": registrant.get("last_name"),
-            "email": registrant.get("email"),
-            "attended": attended_status
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": person.get("user_email"),
+            "attended": 1  # This person attended
         }
         send_to_ghl_webhook(contact_payload)
-        processed_count += 1
+
+    # 4. Process the NO-SHOWS (Absentees)
+    logging.info(f"--- Processing {len(absentees)} Absentees ---")
+    for person in absentees:
+        contact_payload = {
+            "first_name": person.get("first_name"),
+            "last_name": person.get("last_name"),
+            "email": person.get("email"),
+            "attended": 0  # This person was absent
+        }
+        send_to_ghl_webhook(contact_payload)
         
     logging.info("--- Post-Webinar Processing Complete ---")
-    summary = f"Processed {processed_count} registrants. Attended: {attended_count}. Not Attended: {processed_count - attended_count}."
+    summary = f"Processing complete. Sent {len(participants)} attendees and {len(absentees)} absentees to GHL."
     logging.info(summary)
     
     return {"message": "Processing complete.", "summary": summary}
