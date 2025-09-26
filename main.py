@@ -26,7 +26,15 @@ if not all([ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET, ZOOM_WEBINAR_ID
 
 app = FastAPI(title="Zoom & GHL Integration API")
 
-# --- Zoom Authentication & Fetching Helpers (Unchanged from last version) ---
+# --- NEW: Pydantic Model for Registration Body ---
+class WebinarRegistrant(BaseModel):
+    """Defines the expected data for a new webinar registrant."""
+    email: EmailStr
+    first_name: str
+    last_name: Optional[str] = None
+
+
+# --- Zoom Authentication & Fetching Helpers ---
 
 def get_zoom_access_token():
     token_url = "https://zoom.us/oauth/token"
@@ -37,6 +45,7 @@ def get_zoom_access_token():
         logging.info("Successfully obtained Zoom access token.")
         return token_data.get("access_token")
     except requests.exceptions.RequestException as e:
+        logging.error(f"Could not authenticate with Zoom: {e}")
         raise HTTPException(status_code=500, detail="Could not authenticate with Zoom.")
 
 def _fetch_all_from_zoom(endpoint_url: str, headers: Dict[str, str], data_key: str) -> List[Dict[str, Any]]:
@@ -67,6 +76,28 @@ def get_all_past_webinar_participants_from_report(webinar_id: str, access_token:
     logging.info(f"Found {len(participants)} total participants in the report.")
     return participants
 
+# --- NEW: Helper Function for Webinar Registration ---
+def register_person_for_webinar(webinar_id: str, registrant_data: Dict[str, Any], access_token: str) -> Dict[str, Any]:
+    logging.info(f"Attempting to register {registrant_data.get('email')} for webinar {webinar_id}...")
+    url = f"https://api.zoom.us/v2/webinars/{webinar_id}/registrants"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        response = requests.post(url, headers=headers, json=registrant_data)
+        
+        # If the request was not successful (not 201 Created), log the specific error from Zoom
+        if response.status_code != 201:
+            error_details = response.json()
+            logging.error(f"Zoom API registration error: {response.status_code} - {error_details}")
+            raise HTTPException(status_code=response.status_code, detail=error_details)
+
+        zoom_response_data = response.json()
+        logging.info(f"Successfully registered {registrant_data.get('email')}. Join URL created.")
+        return zoom_response_data
+    except requests.exceptions.RequestException as e:
+        logging.error(f"HTTP request failed during Zoom registration: {e}")
+        raise HTTPException(status_code=502, detail="Failed to communicate with Zoom for registration.")
+
+
 def send_to_ghl_webhook(contact_data: Dict[str, Any]):
     try:
         response = requests.post(GHL_WEBHOOK_URL, json=contact_data)
@@ -75,7 +106,44 @@ def send_to_ghl_webhook(contact_data: Dict[str, Any]):
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to send data for {contact_data['email']} to GHL: {e}")
 
-# --- SIMPLIFIED Main Endpoint ---
+
+# --- API Endpoints ---
+
+@app.post("/register-webinar", status_code=201)
+async def register_webinar_attendee(registrant: WebinarRegistrant):
+    """
+    Registers a new participant for the webinar specified by ZOOM_WEBINAR_ID.
+    Accepts a JSON body with email, first_name, and optional last_name.
+    """
+    logging.info(f"--- Received registration request for {registrant.email} ---")
+    access_token = get_zoom_access_token()
+    
+    try:
+        # Convert Pydantic model to dict, excluding fields that were not set (like an optional last_name)
+        registrant_payload = registrant.model_dump(exclude_unset=True)
+        
+        zoom_response = register_person_for_webinar(
+            webinar_id=ZOOM_WEBINAR_ID,
+            registrant_data=registrant_payload,
+            access_token=access_token
+        )
+        
+        summary = f"Successfully registered {registrant.email}."
+        logging.info(summary)
+        
+        return {
+            "message": "Registration successful.",
+            "registrant_id": zoom_response.get("registrant_id"),
+            "join_url": zoom_response.get("join_url")
+        }
+    except HTTPException as e:
+        # Re-raise the exception from the helper function so FastAPI can format the error response
+        raise e
+    except Exception as e:
+        # Catch any other unexpected errors
+        logging.error(f"An unexpected error occurred during registration: {e}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred.")
+
 
 @app.post("/process-attendees")
 async def process_webinar_attendees():
@@ -84,7 +152,6 @@ async def process_webinar_attendees():
     and sends them to a GHL webhook to be tagged as 'Attended'.
     """
     logging.info("--- Starting Post-Webinar Processing (Participants-Only Method) ---")
-
     access_token = get_zoom_access_token()
     
     # 1. Fetch the one list we know exists: the participants
@@ -106,4 +173,5 @@ async def process_webinar_attendees():
     logging.info(summary)
     
     return {"message": "Attendee processing complete.", "summary": summary}
+
 # ¤¤¤ End of Final Code ¤¤¤
